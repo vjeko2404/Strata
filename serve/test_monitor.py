@@ -257,5 +257,75 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertIn(f'"{el}"', js)
 
 
+class CpuCard(unittest.TestCase):
+    """The Monitor's CPU card: the load per physical core (the engine leaves SMT siblings idle, so the all-threads
+    figure of a busy 32-thread CPU stops at ~50%) and the CPU temperature, both read from fake sysfs trees."""
+
+    def test_core_groups(self):
+        from serve.telemetry import _core_groups
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for cpu, sib in ((0, "0,2"), (1, "1,3"), (2, "0,2"), (3, "1,3")):
+                t = Path(d) / f"cpu{cpu}" / "topology"
+                t.mkdir(parents=True)
+                (t / "thread_siblings_list").write_text(sib + "\n")
+            (Path(d) / "cpufreq").mkdir()                        # not a CPU
+            self.assertEqual(_core_groups(d), [[0, 2], [1, 3]])
+            (Path(d) / "cpu1" / "topology" / "core_cpus_list").write_text("1-3\n")   # the newer name wins
+            self.assertEqual(_core_groups(d), [[0, 2], [1, 2, 3], [1, 3]])
+        self.assertIsNone(_core_groups("/nonexistent"))
+
+    def test_core_load(self):
+        from serve.telemetry import _CoreLoad
+        import tempfile
+
+        def stat(rows):   # rows: cpu -> (busy, idle) jiffies
+            return "cpu 0 0 0 0 0 0 0\n" + "".join(f"cpu{c} {b} 0 0 {i} 0 0 0\n" for c, (b, i) in rows.items())
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "stat"
+            f.write_text(stat({0: (0, 0), 1: (0, 0), 2: (0, 0), 3: (0, 0)}))
+            load = _CoreLoad(str(f), [[0, 2], [1, 3]])
+            # cpu0 all busy, its sibling cpu2 idle; cpu1 half busy, cpu3 idle: cores 100% and 50%, all threads 37.5%
+            f.write_text(stat({0: (100, 0), 1: (50, 50), 2: (0, 100), 3: (0, 100)}))
+            self.assertAlmostEqual(load.load(), 75.0)
+            f.write_text(stat({0: (100, 100), 1: (50, 150), 2: (0, 200), 3: (0, 200)}))   # nothing ran
+            self.assertAlmostEqual(load.load(), 0.0)
+        self.assertIsNone(_CoreLoad("/nonexistent", None).load())
+
+    def test_cpu_temperature_sensor(self):
+        from serve.telemetry import _cpu_temp_inputs, _read_temp
+        import tempfile
+
+        def mon(root, n, name, sensors):
+            d = Path(root) / f"hwmon{n}"
+            d.mkdir()
+            (d / "name").write_text(name + "\n")
+            for i, (label, mdeg) in enumerate(sensors, 1):
+                if label:
+                    (d / f"temp{i}_label").write_text(label + "\n")
+                (d / f"temp{i}_input").write_text(f"{mdeg}\n")
+        with tempfile.TemporaryDirectory() as d:
+            mon(d, 0, "nvme", [("Composite", 71850)])
+            mon(d, 1, "k10temp", [("Tctl", 64125), ("Tccd1", 53750)])
+            paths, what = _cpu_temp_inputs(d)
+            self.assertEqual(what, "k10temp Tctl")
+            self.assertAlmostEqual(_read_temp(paths), 64.125)
+        with tempfile.TemporaryDirectory() as d:                 # Intel, two sockets: the hottest package
+            mon(d, 0, "coretemp", [("Package id 0", 50000), ("Core 0", 48000)])
+            mon(d, 1, "coretemp", [("Package id 0", 58000)])
+            paths, what = _cpu_temp_inputs(d)
+            self.assertEqual((what, _read_temp(paths)), ("coretemp Package id 0", 58.0))
+        with tempfile.TemporaryDirectory() as d:                 # no CPU sensor: nothing, not the NVMe's
+            mon(d, 0, "nvme", [("Composite", 71850)])
+            self.assertEqual(_cpu_temp_inputs(d), ([], None))
+        self.assertEqual(_cpu_temp_inputs("/nonexistent"), ([], None))
+        self.assertIsNone(_read_temp(["/nonexistent"]))
+
+    def test_the_card_reads_both(self):
+        js = (Path(__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
+        for key in ("hw.cpu_core", "h.cpu_core", "hw.cpu_temp", "st.cpu_temp_sensor"):
+            self.assertIn(key, js)
+
+
 if __name__ == "__main__":
     unittest.main()

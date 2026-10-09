@@ -295,8 +295,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
             (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
-  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
-  spark("sp-cpu", h.cpu, 100);
+  // the load per physical core where the server can read the topology (Linux): the engine runs one expert-pool
+  // thread per core and leaves the SMT siblings idle, so the all-threads figure of a busy 32-thread CPU reads ~50%
+  const perCore = hw.cpu_core != null;
+  const cpuLoad = perCore ? hw.cpu_core : hw.cpu;
+  setMetric("cpu", cpuLoad == null ? null : fmt(cpuLoad), "%",
+            [hw.cpu_temp == null ? "" : `${fmt(hw.cpu_temp)} °C`,
+             st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : ""].filter(Boolean).join(" · "));
+  $("mv-cpu").closest(".metric-card").title = perCore
+    ? `Load per physical core (a core counts as busy when either of its threads is). All ${st.threads || ""} threads: ` +
+      `${hw.cpu == null ? "–" : fmt(hw.cpu)}%.${st.cpu_temp_sensor ? ` Temperature: ${st.cpu_temp_sensor}.` : ""}`
+    : "";
+  spark("sp-cpu", perCore ? h.cpu_core : h.cpu, 100);
   if (hw.disk_read_mb == null) {
     setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
   } else {

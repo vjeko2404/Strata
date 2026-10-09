@@ -6,6 +6,9 @@ A background thread samples once a second and keeps the last 60 readings of each
   amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
+- Linux also: the load per physical core (sysfs topology + /proc/stat) and the CPU temperature (hwmon: k10temp's
+  Tctl, zenpower's Tdie, coretemp's package sensor).  The engine runs one expert-pool thread per physical core and
+  leaves the SMT siblings idle, so the all-threads load of a busy 16-core / 32-thread CPU reads ~50%.
 Anything that cannot be read is None; nothing here can stop the server.
 """
 from __future__ import annotations
@@ -262,6 +265,131 @@ class _CpuRamFallback:
             return None, None
 
 
+# ------------------------------------------------------------------------------------------------ CPU cores, temperature
+def _cpulist(text):
+    """'0,16' or '0-1' (a sysfs cpulist) -> [0, 16] / [0, 1]."""
+    out = []
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        out.extend(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def _core_groups(root="/sys/devices/system/cpu"):
+    """Linux: the logical CPUs of each physical core, e.g. [[0, 16], [1, 17], ...]; None where sysfs has no topology."""
+    groups = set()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    for n in names:
+        if not (n.startswith("cpu") and n[3:].isdigit()):
+            continue
+        for f in ("core_cpus_list", "thread_siblings_list"):     # the newer name first; both mean the same
+            try:
+                with open(os.path.join(root, n, "topology", f), encoding="ascii") as fh:
+                    groups.add(tuple(_cpulist(fh.read())))
+                break
+            except (OSError, ValueError):
+                continue
+    return sorted(list(g) for g in groups) or None
+
+
+class _CoreLoad:
+    """Linux: the load of each physical core - its busiest logical CPU - averaged over the cores, from /proc/stat."""
+
+    def __init__(self, stat="/proc/stat", groups=None):
+        self.stat = stat
+        self.groups = groups
+        self.prev = self._times() if groups else None
+
+    def _times(self):
+        out = {}
+        try:
+            with open(self.stat, encoding="ascii") as fh:
+                for line in fh:
+                    if line.startswith("cpu") and line[3:4].isdigit():
+                        f = line.split()
+                        v = [int(x) for x in f[1:]]
+                        out[int(f[0][3:])] = (v[3] + v[4], sum(v))       # idle + iowait, all
+        except (OSError, ValueError, IndexError):
+            return None
+        return out
+
+    def load(self):
+        if not self.groups:
+            return None
+        cur = self._times()
+        prev, self.prev = self.prev, cur
+        if not cur or not prev:
+            return None
+        busy = {}
+        for c, (idle, total) in cur.items():
+            if c in prev and total > prev[c][1]:
+                busy[c] = 1.0 - (idle - prev[c][0]) / (total - prev[c][1])
+        cores = [max(busy[c] for c in g if c in busy) for g in self.groups if any(c in busy for c in g)]
+        return max(0.0, min(100.0, 100.0 * sum(cores) / len(cores))) if cores else None
+
+
+# hwmon drivers in order of preference, with the sensor label that is the CPU's own temperature
+_CPU_SENSORS = (("k10temp", ("Tctl", "Tdie")), ("zenpower", ("Tdie", "Tctl")), ("coretemp", ("Package id 0",)))
+
+
+def _cpu_temp_inputs(root="/sys/class/hwmon"):
+    """Linux: the temp*_input files of the CPU's own sensor (one per socket), and what they are, e.g. 'k10temp Tctl'."""
+    try:
+        mons = sorted(os.listdir(root))
+    except OSError:
+        return [], None
+    names = {}
+    for m in mons:
+        try:
+            with open(os.path.join(root, m, "name"), encoding="ascii") as fh:
+                names[m] = fh.read().strip()
+        except OSError:
+            continue
+    for driver, labels in _CPU_SENSORS:
+        found = []
+        for m, name in names.items():
+            if name != driver:
+                continue
+            d = os.path.join(root, m)
+            by_label = {}
+            try:
+                files = sorted(os.listdir(d))
+            except OSError:
+                continue
+            for f in files:
+                if f.startswith("temp") and f.endswith("_label"):
+                    try:
+                        with open(os.path.join(d, f), encoding="ascii") as fh:
+                            by_label[fh.read().strip()] = os.path.join(d, f[:-len("_label")] + "_input")
+                    except OSError:
+                        continue
+            pick = next(((lb, by_label[lb]) for lb in labels if lb in by_label), None)
+            if pick is None and os.path.exists(os.path.join(d, "temp1_input")):
+                pick = ("temp1", os.path.join(d, "temp1_input"))
+            if pick:
+                found.append(pick)
+        if found:
+            return [p for _, p in found], f"{driver} {found[0][0]}"
+    return [], None
+
+
+def _read_temp(paths):
+    """The hottest of `paths` (m°C files) in °C, None when none can be read."""
+    vals = []
+    for p in paths:
+        try:
+            with open(p, encoding="ascii") as fh:
+                vals.append(int(fh.read().strip()) / 1000.0)
+        except (OSError, ValueError):
+            continue
+    return max(vals) if vals else None
+
+
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
@@ -284,6 +412,9 @@ class Telemetry:
         except ImportError:
             self.ps = None
         self.fallback = _CpuRamFallback()
+        linux = sys.platform.startswith("linux")
+        self.core_load = _CoreLoad(groups=_core_groups()) if linux else None
+        self.cpu_temp_paths, cpu_temp_sensor = _cpu_temp_inputs() if linux else ([], None)
         self.static = {
             "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
             "gpu_count": len(self.gpus),
@@ -291,6 +422,7 @@ class Telemetry:
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
             "psutil": self.ps is not None,
+            "cpu_temp_sensor": cpu_temp_sensor,
         }
         self._disk_prev = None
         threading.Thread(target=self._loop, daemon=True).start()
@@ -338,6 +470,10 @@ class Telemetry:
         else:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
+        if self.core_load:
+            s["cpu_core"] = self.core_load.load()
+        if self.cpu_temp_paths:
+            s["cpu_temp"] = _read_temp(self.cpu_temp_paths)
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
         if self.extra:
             try:
@@ -351,8 +487,8 @@ class Telemetry:
             s = self.sample()
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "cpu_core",
+                          "cpu_temp", "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             time.sleep(1.0)
